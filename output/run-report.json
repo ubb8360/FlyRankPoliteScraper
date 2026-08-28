@@ -1,0 +1,15 @@
+{
+  "start_time": "2026-08-28T12:15:13.303237Z",
+  "duration_seconds": 5.904,
+  "pages_fetched": 0,
+  "cache_hits": 63,
+  "valid_records": 60,
+  "invalid_records": 0,
+  "failed_pages": 1,
+  "failures": [
+    {
+      "url": "https://books.toscrape.com/catalogue/this-book-does-not-exist-stage-5/index.html",
+      "reason": "HTTP 404: https://books.toscrape.com/catalogue/this-book-does-not-exist-stage-5/index.html"
+    }
+  ]
+}

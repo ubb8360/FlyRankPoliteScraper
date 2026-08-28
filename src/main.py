@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from time import sleep
+from time import perf_counter, sleep
 from typing import Optional
 from urllib.parse import urljoin, urlparse
 
@@ -12,6 +12,11 @@ from pydantic import BaseModel, ValidationError, field_validator
 
 START_URL = "https://books.toscrape.com/catalogue/page-1.html"
 
+TEST_BROKEN_URL = (
+    "https://books.toscrape.com/catalogue/"
+    "this-book-does-not-exist-stage-5/index.html"
+)
+
 USER_AGENT = (
     "FlyRankInternship-A9/1.0 "
     "(+https://github.com/ubb8360/FlyRankPoliteScraper)"
@@ -19,6 +24,7 @@ USER_AGENT = (
 
 TIMEOUT_SECONDS = 10
 REQUEST_DELAY_SECONDS = 0.5
+RETRY_DELAY_SECONDS = 1.0
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = PROJECT_ROOT / "cache"
@@ -26,6 +32,11 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 
 BOOKS_PATH = OUTPUT_DIR / "books.json"
 ERRORS_PATH = OUTPUT_DIR / "errors.json"
+RUN_REPORT_PATH = OUTPUT_DIR / "run-report.json"
+
+
+class FetchError(Exception):
+    pass
 
 
 class BookRecord(BaseModel):
@@ -48,6 +59,14 @@ class BookRecord(BaseModel):
         return value
 
 
+def utc_now():
+    return (
+        datetime.now(timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
 def cache_path_for_url(url):
     parsed_url = urlparse(url)
     path = parsed_url.path.strip("/")
@@ -55,7 +74,6 @@ def cache_path_for_url(url):
     if path.startswith("catalogue/page-") and path.endswith(".html"):
         filename = Path(path).name
     else:
-        # Unique filename for each cache
         filename = path.replace("/", "__")
 
     return CACHE_DIR / filename
@@ -71,53 +89,85 @@ def timestamp_for_cache(cache_path):
     )
 
 
-def get_page(url):
+def get_page(url, stats):
     cache_path = cache_path_for_url(url)
 
     if cache_path.exists():
         content = cache_path.read_bytes()
         fetched_at = timestamp_for_cache(cache_path)
 
+        stats["cache_hits"] += 1
+
         print(f"CACHE HIT: {url}")
 
         return content, fetched_at
 
-    print(f"FETCH: {url}")
+    for attempt in range(1, 3):
+        print(f"FETCH: {url} (attempt {attempt})")
 
-    try:
-        response = requests.get(
-            url,
-            headers={"User-Agent": USER_AGENT},
-            timeout=TIMEOUT_SECONDS,
+        try:
+            response = requests.get(
+                url,
+                headers={"User-Agent": USER_AGENT},
+                timeout=TIMEOUT_SECONDS,
+            )
+
+        except requests.Timeout as exc:
+            if attempt == 1:
+                print("RETRY: request timed out")
+                sleep(RETRY_DELAY_SECONDS)
+                continue
+
+            raise FetchError(
+                f"Request timed out after 2 attempts: {url}"
+            ) from exc
+
+        except requests.RequestException as exc:
+            sleep(REQUEST_DELAY_SECONDS)
+
+            raise FetchError(
+                f"Request failed: {url}: {exc}"
+            ) from exc
+
+        if response.status_code == 200:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+            fetched_at = utc_now()
+            cache_path.write_bytes(response.content)
+
+            stats["pages_fetched"] += 1
+
+            print(f"status={response.status_code}")
+            print(
+                f"response_size={len(response.content)} bytes"
+            )
+        # Delay only after a real network request.
+
+            sleep(REQUEST_DELAY_SECONDS)
+
+            return response.content, fetched_at
+
+        # Retry once for server errors.
+        if 500 <= response.status_code <= 599 and attempt == 1:
+            print(
+                f"RETRY: server returned "
+                f"HTTP {response.status_code}"
+            )
+
+            sleep(RETRY_DELAY_SECONDS)
+            continue
+
+        # Do not retry 403, 404, or other non-retryable responses.
+        sleep(REQUEST_DELAY_SECONDS)
+
+        raise FetchError(
+            f"HTTP {response.status_code}: {url}"
         )
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Request failed: {exc}") from exc
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Fetch failed with HTTP status {response.status_code}: {url}"
-        )
-
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    fetched_at = (
-        datetime.now(timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-
-    cache_path.write_bytes(response.content)
-
-    print(f"status={response.status_code}")
-    print(f"response_size={len(response.content)} bytes")
-
-    # Delay only after a real network request.
-    sleep(REQUEST_DELAY_SECONDS)
-
-    return response.content, fetched_at
+    raise FetchError(f"Unable to fetch: {url}")
 
 
-def discover_books():
+def discover_books(stats):
     current_url = START_URL
 
     catalogue_pages = 0
@@ -127,7 +177,7 @@ def discover_books():
     discovered_books = {}
 
     while current_url and catalogue_pages < 3:
-        html, _ = get_page(current_url)
+        html, _ = get_page(current_url, stats)
         soup = BeautifulSoup(html, "html.parser")
 
         catalogue_pages += 1
@@ -141,9 +191,11 @@ def discover_books():
                 product_url = urljoin(current_url, href)
 
                 discovered_count += 1
-
                 # Keep only the first occurrence of a URL.
-                discovered_books.setdefault(product_url, current_url)
+                discovered_books.setdefault(
+                    product_url,
+                    current_url,
+                )
 
         next_link = soup.select_one("li.next a")
 
@@ -164,13 +216,19 @@ def discover_books():
     return discovered_books
 
 
-def extract_book(product_url, source_page):
-    html, fetched_at = get_page(product_url)
+def extract_book(product_url, source_page, stats):
+    html, fetched_at = get_page(
+        product_url,
+        stats,
+    )
+
     soup = BeautifulSoup(html, "html.parser")
 
     product_main = soup.select_one("div.product_main")
 
-    title = product_main.select_one("h1").get_text(strip=True)
+    title = product_main.select_one("h1").get_text(
+        strip=True
+    )
 
     price_text = (
         product_main
@@ -184,7 +242,10 @@ def extract_book(product_url, source_page):
         .get_text(" ", strip=True)
     )
 
-    rating_tag = product_main.select_one("p.star-rating")
+    rating_tag = product_main.select_one(
+        "p.star-rating"
+    )
+
     rating_classes = rating_tag.get("class", [])
 
     rating_text = next(
@@ -218,18 +279,35 @@ def extract_book(product_url, source_page):
     }
 
 
-def extract_all_books(discovered_books):
+def extract_all_books(
+    discovered_books,
+    stats,
+):
     raw_records = []
+    failures = []
 
     for product_url, source_page in discovered_books.items():
-        record = extract_book(
-            product_url,
-            source_page,
-        )
+        try:
+            record = extract_book(
+                product_url,
+                source_page,
+                stats,
+            )
 
-        raw_records.append(record)
+            raw_records.append(record)
 
-    return raw_records
+        except FetchError as exc:
+            print(f"SKIP: {product_url}")
+            print(f"reason={exc}")
+
+            failures.append(
+                {
+                    "url": product_url,
+                    "reason": str(exc),
+                }
+            )
+
+    return raw_records, failures
 
 
 def normalize_price(price_text):
@@ -261,7 +339,6 @@ def validate_records(raw_records):
             )
 
             record = validated.model_dump()
-
            # Keep only first occurance
             valid_records[record["product_url"]] = record
 
@@ -277,7 +354,10 @@ def validate_records(raw_records):
 
 
 def write_output(valid_records, errors):
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     BOOKS_PATH.write_text(
         json.dumps(
@@ -298,11 +378,40 @@ def write_output(valid_records, errors):
     )
 
 
-def main():
-    discovered_books = discover_books()
+def write_run_report(report):
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    raw_records = extract_all_books(
-        discovered_books
+    RUN_REPORT_PATH.write_text(
+        json.dumps(
+            report,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def main():
+    start_time = utc_now()
+    timer_start = perf_counter()
+
+    stats = {
+        "pages_fetched": 0,
+        "cache_hits": 0,
+    }
+
+    discovered_books = discover_books(stats)
+
+    # Stage 5 failure test:
+    # ADD one fake URL.
+    discovered_books[TEST_BROKEN_URL] = START_URL
+
+    raw_records, failures = extract_all_books(
+        discovered_books,
+        stats,
     )
 
     valid_records, errors = validate_records(
@@ -314,11 +423,31 @@ def main():
         errors,
     )
 
+    duration_seconds = round(
+        perf_counter() - timer_start,
+        3,
+    )
+
+    report = {
+        "start_time": start_time,
+        "duration_seconds": duration_seconds,
+        "pages_fetched": stats["pages_fetched"],
+        "cache_hits": stats["cache_hits"],
+        "valid_records": len(valid_records),
+        "invalid_records": len(errors),
+        "failed_pages": len(failures),
+        "failures": failures,
+    }
+
+    write_run_report(report)
+
     print()
     print(f"valid_records={len(valid_records)}")
     print(f"invalid_records={len(errors)}")
-    print(f"books_file={BOOKS_PATH}")
-    print(f"errors_file={ERRORS_PATH}")
+    print(f"failed_pages={len(failures)}")
+    print(f"pages_fetched={stats['pages_fetched']}")
+    print(f"cache_hits={stats['cache_hits']}")
+    print(f"run_report={RUN_REPORT_PATH}")
 
 
 if __name__ == "__main__":
