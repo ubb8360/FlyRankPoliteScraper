@@ -2,10 +2,12 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 from time import sleep
+from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, ValidationError, field_validator
 
 
 START_URL = "https://books.toscrape.com/catalogue/page-1.html"
@@ -20,6 +22,30 @@ REQUEST_DELAY_SECONDS = 0.5
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = PROJECT_ROOT / "cache"
+OUTPUT_DIR = PROJECT_ROOT / "output"
+
+BOOKS_PATH = OUTPUT_DIR / "books.json"
+ERRORS_PATH = OUTPUT_DIR / "errors.json"
+
+
+class BookRecord(BaseModel):
+    title: str
+    product_url: str
+    price_text: str
+    price_gbp: float
+    availability_text: str
+    rating_text: str
+    description: Optional[str]
+    source_page: str
+    fetched_at: str
+
+    @field_validator("product_url", "source_page")
+    @classmethod
+    def require_https(cls, value):
+        if not value.startswith("https://"):
+            raise ValueError("URL must start with https://")
+
+        return value
 
 
 def cache_path_for_url(url):
@@ -206,23 +232,93 @@ def extract_all_books(discovered_books):
     return raw_records
 
 
+def normalize_price(price_text):
+    cleaned_price = (
+        price_text
+        .replace("£", "")
+        .replace(",", "")
+        .strip()
+    )
+
+    return float(cleaned_price)
+
+
+def validate_records(raw_records):
+    valid_records = {}
+    errors = []
+
+    for raw_record in raw_records:
+        try:
+            normalized_record = {
+                **raw_record,
+                "price_gbp": normalize_price(
+                    raw_record["price_text"]
+                ),
+            }
+
+            validated = BookRecord.model_validate(
+                normalized_record
+            )
+
+            record = validated.model_dump()
+
+           # Keep only first occurance
+            valid_records[record["product_url"]] = record
+
+        except (ValidationError, ValueError) as exc:
+            errors.append(
+                {
+                    "record": raw_record,
+                    "reason": str(exc),
+                }
+            )
+
+    return list(valid_records.values()), errors
+
+
+def write_output(valid_records, errors):
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    BOOKS_PATH.write_text(
+        json.dumps(
+            valid_records,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    ERRORS_PATH.write_text(
+        json.dumps(
+            errors,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
 def main():
     discovered_books = discover_books()
 
-    raw_records = extract_all_books(discovered_books)
+    raw_records = extract_all_books(
+        discovered_books
+    )
 
-    print()
-    print("Sample raw record:")
-    print(
-        json.dumps(
-            raw_records[0],
-            indent=2,
-            ensure_ascii=False,
-        )
+    valid_records, errors = validate_records(
+        raw_records
+    )
+
+    write_output(
+        valid_records,
+        errors,
     )
 
     print()
-    print(f"detail_pages={len(raw_records)}")
+    print(f"valid_records={len(valid_records)}")
+    print(f"invalid_records={len(errors)}")
+    print(f"books_file={BOOKS_PATH}")
+    print(f"errors_file={ERRORS_PATH}")
 
 
 if __name__ == "__main__":
